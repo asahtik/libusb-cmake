@@ -2639,20 +2639,26 @@ static int winusbx_open(int sub_api, struct libusb_device_handle *dev_handle)
 		if ((priv->usb_interface[i].path != NULL)
 				&& (priv->usb_interface[i].apib->id == USB_API_WINUSBX)) {
 			handle_priv->interface_handle[i].dev_handle = INVALID_HANDLE_VALUE;
+			handle_priv->interface_handle[i].api_handle = INVALID_HANDLE_VALUE;
+			handle_priv->interface_handle[i].claimed_interfaces_count = 0;
+			handle_priv->interface_handle[i].interface_claimed = false;
 		}
 	}
 
 	return LIBUSB_SUCCESS;
 }
 
-static HANDLE ensure_dev_handle(struct libusb_device_handle *dev_handle, uint8_t iface)
+static int ensure_dev_handle(struct libusb_device_handle *dev_handle, uint8_t iface, HANDLE *file_handle, bool *opened_new)
 {
 	struct winusb_device_handle_priv* handle_priv = get_winusb_device_handle_priv(dev_handle);
 	struct winusb_device_priv* priv = usbi_get_device_priv(dev_handle->dev);
 	struct libusb_context* ctx = HANDLE_CTX(dev_handle);
 
+	*opened_new = false;
+
 	if (handle_priv->interface_handle[iface].dev_handle != INVALID_HANDLE_VALUE) {
-		return handle_priv->interface_handle[iface].dev_handle;
+		*file_handle = handle_priv->interface_handle[iface].dev_handle;
+		return LIBUSB_SUCCESS;
 	}
 
 	if ((priv->usb_interface[iface].path != NULL)
@@ -2661,11 +2667,21 @@ static HANDLE ensure_dev_handle(struct libusb_device_handle *dev_handle, uint8_t
 		handle_priv->interface_handle[iface].dev_handle = windows_open(dev_handle, priv->usb_interface[iface].path, GENERIC_READ | GENERIC_WRITE);
 		handle_priv->interface_handle[iface].claimed_interfaces_count = 0;
 		if (handle_priv->interface_handle[iface].dev_handle == INVALID_HANDLE_VALUE) {
-			return INVALID_HANDLE_VALUE;
+			usbi_err(ctx, "could not open device %s (interface %d): %s", priv->usb_interface[iface].path, iface, windows_error_str(0));
+			switch (GetLastError()) {
+			case ERROR_FILE_NOT_FOUND:
+				return LIBUSB_ERROR_NO_DEVICE;
+			case ERROR_ACCESS_DENIED:
+				return LIBUSB_ERROR_ACCESS;
+			default:
+				return LIBUSB_ERROR_IO;
+			}
 		}
+		*opened_new = true;
 	}
 
-	return handle_priv->interface_handle[iface].dev_handle;
+	*file_handle = handle_priv->interface_handle[iface].dev_handle;
+	return HANDLE_VALID(*file_handle) ? LIBUSB_SUCCESS : LIBUSB_ERROR_NOT_FOUND;
 }
 
 static void winusbx_close(int sub_api, struct libusb_device_handle *dev_handle)
@@ -2807,6 +2823,8 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 	DWORD err, _index;
 	int r;
 	uint8_t initialized_iface;
+	bool opened_dev_handle = false;
+	bool auto_initialized_root = false;
 
 	CHECK_WINUSBX_AVAILABLE(sub_api);
 
@@ -2819,9 +2837,20 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 	if (((is_using_usbccgp) || (iface == 0)) &&
 	    (!is_associated_interface || (iface==priv->usb_interface[iface].first_associated_interface))) {
 		// composite device (independent interfaces) or interface 0
-		file_handle = ensure_dev_handle(dev_handle, iface);
-		if (!HANDLE_VALID(file_handle))
-			return LIBUSB_ERROR_NOT_FOUND;
+		if (handle_priv->interface_handle[iface].interface_claimed)
+			return LIBUSB_ERROR_BUSY;
+
+		if (HANDLE_VALID(handle_priv->interface_handle[iface].api_handle)) {
+			handle_priv->interface_handle[iface].claimed_interfaces_count++;
+			handle_priv->interface_handle[iface].interface_claimed = true;
+			usbi_dbg(ctx, "claimed interface %u", iface);
+			handle_priv->active_interface = iface;
+			return LIBUSB_SUCCESS;
+		}
+
+		r = ensure_dev_handle(dev_handle, iface, &file_handle, &opened_dev_handle);
+		if (r != LIBUSB_SUCCESS)
+			return r;
 
 		if (!WinUSBX[sub_api].Initialize(file_handle, &winusb_handle)) {
 			handle_priv->interface_handle[iface].api_handle = INVALID_HANDLE_VALUE;
@@ -2830,6 +2859,10 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 			case ERROR_BAD_COMMAND:
 				// The device was disconnected
 				usbi_err(ctx, "could not access interface %u: %s", iface, windows_error_str(0));
+				if (opened_dev_handle) {
+					CloseHandle(handle_priv->interface_handle[iface].dev_handle);
+					handle_priv->interface_handle[iface].dev_handle = INVALID_HANDLE_VALUE;
+				}
 				return LIBUSB_ERROR_NO_DEVICE;
 			default:
 				// it may be that we're using the libusb0 filter driver.
@@ -2858,7 +2891,6 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 								// Replace the existing file handle with the working one
 								CloseHandle(handle_priv->interface_handle[iface].dev_handle);
 								handle_priv->interface_handle[iface].dev_handle = file_handle;
-								handle_priv->interface_handle[iface].claimed_interfaces_count = 1;
 								found_filter = true;
 							} else {
 								usbi_err(ctx, "could not initialize filter driver for %s", filter_path);
@@ -2870,15 +2902,17 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 					}
 				}
 				if (r != LIBUSB_SUCCESS)
-					return r;
+					goto claim_root_cleanup;
 				if (!found_filter) {
 					usbi_err(ctx, "could not access interface %u: %s", iface, windows_error_str(err));
-					return LIBUSB_ERROR_ACCESS;
+					r = LIBUSB_ERROR_ACCESS;
+					goto claim_root_cleanup;
 				}
 			}
 		}
 		handle_priv->interface_handle[iface].api_handle = winusb_handle;
-		handle_priv->interface_handle[iface].claimed_interfaces_count = 1;
+		handle_priv->interface_handle[iface].claimed_interfaces_count++;
+		handle_priv->interface_handle[iface].interface_claimed = true;
 	} else {
 		if (is_associated_interface) {
 			initialized_iface = priv->usb_interface[iface].first_associated_interface;
@@ -2890,23 +2924,25 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 			initialized_iface = 0;
 		}
 
+		if (handle_priv->interface_handle[iface].interface_claimed)
+			return LIBUSB_ERROR_BUSY;
+
 		// For all other interfaces, use GetAssociatedInterface()
 		winusb_handle = handle_priv->interface_handle[initialized_iface].api_handle;
 		// It is a requirement for multiple interface devices on Windows that, to you
 		// must first claim the first interface before you claim the others
 		if (!HANDLE_VALID(winusb_handle)) {
-			file_handle = ensure_dev_handle(dev_handle, initialized_iface);
-			if (!HANDLE_VALID(file_handle)) {
-				return LIBUSB_ERROR_NOT_FOUND;
-			}
+			r = ensure_dev_handle(dev_handle, initialized_iface, &file_handle, &opened_dev_handle);
+			if (r != LIBUSB_SUCCESS)
+				return r;
 			if (WinUSBX[sub_api].Initialize(file_handle, &winusb_handle)) {
 				handle_priv->interface_handle[initialized_iface].api_handle = winusb_handle;
-				handle_priv->interface_handle[initialized_iface].claimed_interfaces_count = 0;
+				auto_initialized_root = true;
 				usbi_warn(ctx, "auto-claimed interface %u (required to claim %u with WinUSB)", initialized_iface, iface);
 			} else {
 				usbi_warn(ctx, "failed to auto-claim interface %u (required to claim %u with WinUSB): %s",
 						initialized_iface, iface, windows_error_str(0));
-				return LIBUSB_ERROR_ACCESS;
+				goto claim_associated_cleanup;
 			}
 		}
 		if (!WinUSBX[sub_api].GetAssociatedInterface(winusb_handle, (UCHAR)(iface - 1 - initialized_iface),
@@ -2914,23 +2950,47 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 			handle_priv->interface_handle[iface].api_handle = INVALID_HANDLE_VALUE;
 			switch (GetLastError()) {
 			case ERROR_NO_MORE_ITEMS:   // invalid iface
-				return LIBUSB_ERROR_NOT_FOUND;
+				r = LIBUSB_ERROR_NOT_FOUND;
+				break;
 			case ERROR_BAD_COMMAND:     // The device was disconnected
-				return LIBUSB_ERROR_NO_DEVICE;
+				r = LIBUSB_ERROR_NO_DEVICE;
+				break;
 			case ERROR_ALREADY_EXISTS:  // already claimed
-				return LIBUSB_ERROR_BUSY;
+				r = LIBUSB_ERROR_BUSY;
+				break;
 			default:
 				usbi_err(ctx, "could not claim interface %u: %s", iface, windows_error_str(0));
-				return LIBUSB_ERROR_ACCESS;
+				r = LIBUSB_ERROR_ACCESS;
+				break;
 			}
+			goto claim_associated_cleanup;
 		}
 		handle_priv->interface_handle[iface].dev_handle = handle_priv->interface_handle[initialized_iface].dev_handle;
 		handle_priv->interface_handle[initialized_iface].claimed_interfaces_count++;
+		handle_priv->interface_handle[iface].interface_claimed = true;
 	}
 	usbi_dbg(ctx, "claimed interface %u", iface);
 	handle_priv->active_interface = iface;
 
 	return LIBUSB_SUCCESS;
+
+claim_root_cleanup:
+		if (opened_dev_handle) {
+			CloseHandle(handle_priv->interface_handle[iface].dev_handle);
+			handle_priv->interface_handle[iface].dev_handle = INVALID_HANDLE_VALUE;
+		}
+		return r;
+
+claim_associated_cleanup:
+	if (auto_initialized_root) {
+		WinUSBX[sub_api].Free(handle_priv->interface_handle[initialized_iface].api_handle);
+		handle_priv->interface_handle[initialized_iface].api_handle = INVALID_HANDLE_VALUE;
+	}
+	if (opened_dev_handle) {
+		CloseHandle(handle_priv->interface_handle[initialized_iface].dev_handle);
+		handle_priv->interface_handle[initialized_iface].dev_handle = INVALID_HANDLE_VALUE;
+	}
+	return r;
 }
 
 static int winusbx_release_interface(int sub_api, struct libusb_device_handle *dev_handle, uint8_t iface)
@@ -2940,11 +3000,12 @@ static int winusbx_release_interface(int sub_api, struct libusb_device_handle *d
 	struct winusb_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
 	bool is_using_usbccgp = (priv->apib->id == USB_API_COMPOSITE);
 	HANDLE winusb_handle;
+	bool keep_root_handle;
 
 	CHECK_WINUSBX_AVAILABLE(sub_api);
 
 	winusb_handle = handle_priv->interface_handle[iface].api_handle;
-	if (!HANDLE_VALID(winusb_handle))
+	if (!HANDLE_VALID(winusb_handle) || !handle_priv->interface_handle[iface].interface_claimed)
 		return LIBUSB_ERROR_NOT_FOUND;
 
 	int initialized_iface;
@@ -2958,8 +3019,13 @@ static int winusbx_release_interface(int sub_api, struct libusb_device_handle *d
 
 	usbi_dbg(ctx, "libusb: release_interface(%p, %d) initialized_iface=%d claimed_count = %d", dev_handle, iface, initialized_iface, handle_priv->interface_handle[initialized_iface].claimed_interfaces_count);
 
-	WinUSBX[sub_api].Free(winusb_handle);
-	handle_priv->interface_handle[iface].api_handle = INVALID_HANDLE_VALUE;
+	keep_root_handle = (iface == initialized_iface)
+		&& (handle_priv->interface_handle[initialized_iface].claimed_interfaces_count > 1);
+	if (!keep_root_handle) {
+		WinUSBX[sub_api].Free(winusb_handle);
+		handle_priv->interface_handle[iface].api_handle = INVALID_HANDLE_VALUE;
+	}
+	handle_priv->interface_handle[iface].interface_claimed = false;
 	handle_priv->interface_handle[initialized_iface].claimed_interfaces_count--;
 
 	if (handle_priv->interface_handle[initialized_iface].claimed_interfaces_count == 0)	{
@@ -2968,7 +3034,9 @@ static int winusbx_release_interface(int sub_api, struct libusb_device_handle *d
 		if (initialized_iface == iface)	{
 			CloseHandle(handle_priv->interface_handle[initialized_iface].dev_handle);
 		} else {
-			WinUSBX[sub_api].Free(handle_priv->interface_handle[initialized_iface].api_handle);
+			winusb_handle = handle_priv->interface_handle[initialized_iface].api_handle;
+			if (HANDLE_VALID(winusb_handle))
+				WinUSBX[sub_api].Free(winusb_handle);
 			CloseHandle(handle_priv->interface_handle[initialized_iface].dev_handle);
 		}
 
@@ -2976,7 +3044,9 @@ static int winusbx_release_interface(int sub_api, struct libusb_device_handle *d
 		handle_priv->interface_handle[initialized_iface].api_handle = INVALID_HANDLE_VALUE;
 	}
 
-	handle_priv->interface_handle[iface].dev_handle = INVALID_HANDLE_VALUE;
+	if ((initialized_iface != iface)
+			|| (handle_priv->interface_handle[initialized_iface].claimed_interfaces_count == 0))
+		handle_priv->interface_handle[iface].dev_handle = INVALID_HANDLE_VALUE;
 
 	return LIBUSB_SUCCESS;
 }

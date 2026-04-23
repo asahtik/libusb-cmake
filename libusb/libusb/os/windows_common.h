@@ -289,6 +289,7 @@ struct winusb_device_handle_priv {
 		HANDLE api_handle; // used by the API to communicate with the device
 		uint8_t zlp[USB_MAXENDPOINTS]; // Current per-endpoint SHORT_PACKET_TERMINATE status (enum WINUSB_ZLP)
 		int claimed_interfaces_count;
+		bool interface_claimed;
 	} interface_handle[USB_MAXINTERFACES];
 	int autoclaim_count[USB_MAXINTERFACES]; // For auto-release
 };
