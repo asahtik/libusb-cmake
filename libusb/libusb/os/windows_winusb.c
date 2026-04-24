@@ -2169,13 +2169,25 @@ static int winusb_claim_interface(struct libusb_device_handle *dev_handle, uint8
 
 	CHECK_SUPPORTED_API(priv->apib, claim_interface);
 
-	safe_free(priv->usb_interface[iface].endpoint);
-	priv->usb_interface[iface].nb_endpoints = 0;
-
 	r = priv->apib->claim_interface(SUB_API_NOTSET, dev_handle, iface);
 
-	if (r == LIBUSB_SUCCESS)
-		r = windows_assign_endpoints(dev_handle, iface, 0);
+	if (r == LIBUSB_SUCCESS) {
+		/*
+		 * Endpoint ownership is cached in device_priv and shared by all open
+		 * handles for this device. Rebuilding that cache on every claim creates
+		 * a race where another thread can briefly observe no endpoints mapped to
+		 * the interface and fail interface_by_endpoint() during an active bulk
+		 * transfer. For repeated claims on altsetting 0, keep the cached
+		 * endpoint list stable and only re-run the per-handle pipe setup.
+		 */
+		if ((priv->usb_interface[iface].endpoint != NULL)
+				&& (priv->usb_interface[iface].current_altsetting == 0)) {
+			if (priv->apib->configure_endpoints)
+				r = priv->apib->configure_endpoints(SUB_API_NOTSET, dev_handle, iface);
+		} else {
+			r = windows_assign_endpoints(dev_handle, iface, 0);
+		}
+	}
 
 	return r;
 }
